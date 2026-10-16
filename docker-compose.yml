@@ -1,0 +1,18 @@
+services:
+  api:
+    build: ./api
+    environment:
+      # Måste matcha adressen du surfar till (passkeys är knutna till domänen).
+      ORIGIN: ${ORIGIN:-http://localhost:8080}
+    volumes:
+      - fiskedata:/data
+    restart: unless-stopped
+  web:
+    build: ./web
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+volumes:
+  fiskedata:
