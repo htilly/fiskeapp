@@ -42,7 +42,7 @@ export function Login({ onLogin }: { onLogin: (u: User) => void }) {
         </>
       )}
       {err && <p className="error">{err}</p>}
-      <p className="tiny muted">Ingen e-post, inga lösenord. Du låser upp med telefonens Face ID, fingeravtryck eller Windows Hello.</p>
+      <p className="tiny muted">Ingen e-post, inga lösenord. Du låser upp med telefonens Face ID (iPhone) eller fingeravtryck/ansiktslås/skärmlås (Android), eller Windows Hello.</p>
     </div>
   );
 }
