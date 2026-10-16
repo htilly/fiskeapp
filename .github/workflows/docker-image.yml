@@ -1,0 +1,69 @@
+name: Build and Push Docker Image
+
+# Bygger EN image (nginx + API i samma container, se Dockerfile i roten) på en
+# GitHub-hostad runner och pushar den till ghcr.io.
+#
+# VARFÖR ingen self-hosted runner här: det här repot är PUBLIKT. En runner på
+# tillyse skulle låta en fork-PR köra godtycklig kod på servern. I stället
+# HÄMTAR tillyse imagen själv - den nattliga `docker compose pull` (04:00) /
+# `up -d` (04:05) plockar upp en ny :main automatiskt. Se kommentaren vid
+# fiskeapp i /config/docker-compose.yml på tillyse.
+#
+# Rulla tillbaka genom att peka servern på en :main-<sha>-tagg i stället.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: fiskeapp
+
+jobs:
+  build:
+    name: Build and push to ghcr.io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Räcker för att pusha till ghcr.io för det här repot. GITHUB_TOKEN skapas
+      # automatiskt per körning, så ingen PAT behöver skapas eller lagras.
+      packages: write
+
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # Ingen QEMU och ingen matris: bara linux/amd64. ubuntu-latest är amd64
+      # och tillyse är x86_64, så arm64 skulle bara kosta byggtid.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Determine Docker tags
+        id: docker_tags
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          # ghcr kräver gemener i image-namnet.
+          IMAGE="ghcr.io/$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')/${IMAGE_NAME}"
+          echo "tags=${IMAGE}:main,${IMAGE}:main-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: GIT_SHA=${{ github.sha }}
+          tags: ${{ steps.docker_tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
