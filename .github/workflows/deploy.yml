@@ -60,7 +60,7 @@ jobs:
       # VILKA KONTON FAR DEPLOYA TILL TILLYSE
       # Mellanslagsseparerade GitHub-anvandarnamn. Lagg till fler har.
       # Tom lista = ingen deploy sker over huvud taget.
-      ALLOWED_ACTORS: "htilly"
+      ALLOWED_ACTORS: "htilly EmilMandahl"
       # =====================================================================
 
       # actor = den som startade bygget. triggering_actor = den som startade
