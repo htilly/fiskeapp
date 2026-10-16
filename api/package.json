@@ -1,0 +1,18 @@
+{
+  "name": "fiskeapp-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.3",
+    "@fastify/multipart": "^10.1.4",
+    "@fastify/static": "^10.1.6",
+    "@simplewebauthn/server": "^14.0.3",
+    "fastify": "^5.12.7"
+  }
+}
