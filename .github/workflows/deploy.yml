@@ -1,69 +1,419 @@
 name: Deploy to tillyse
 
-# Deployar på tillyse via en self-hosted runner när en release publiceras.
+# Kors pa den self-hosted runnern (fiskeapp-runner) pa tillyse efter att
+# "Build and Push Docker Image" har pushat en ny image for en push till main.
 #
-# SÄKERHET: repot är publikt och runnern kör som en användare i docker-gruppen
-# (= root-ekvivalent). Därför:
-#   - jobbet triggas ENBART av `release: published` (kräver write-access till
-#     repot) - aldrig av pull_request, push eller fork-händelser.
-#   - repots inställning "Fork pull request workflows" ska vara "Require approval
-#     for all outside collaborators", annars kan en fork-PR som ändrar den här
-#     filen köra kod på servern.
-#   - runnern har ett eget label (tillyse-deploy) och används av inget annat.
+# Runnern pratar med Docker via kraftmon-docker-proxy, som har BUILD=0 och
+# EXEC=0: det har jobbet KAN inte bygga nagot pa tillyse och inte exec:a in i
+# nagon container. Det kan bara hamta en redan publicerad image fran ghcr.io och
+# aterskapa den enda tjansten `fiskeapp` - de ovriga ~62 containrarna pa maskinen
+# ror den aldrig.
 #
-# Imagen byggs av docker-image.yml vid push till main. Den här workflowen väntar
-# på att imagen för releasens commit finns, drar :main och startar om fiskeapp.
+# Repot ar PUBLIKT, sa gardena nedan ar det som haller fork-kod borta fran
+# maskinen: jobbet kraver ett lyckat bygge av en push till main i detta repo,
+# OCH att kontot bakom bygget star i ALLOWED_ACTORS i gate-jobbet.
+
+# Ersatter den tidigare release-triggade varianten av den har filen: deployen
+# ska ske direkt vid merge till main, inte nar en release publiceras. Behovs
+# release-triggern igen kan den laggas tillbaka som ett andra inpass, men da
+# maste gardena nedan forgrenas pa github.event_name - release-handelser har
+# ingen github.event.workflow_run alls.
+#
+# Till skillnad fran den varianten passerar alla compose-anrop harunder
+# --env-file "$COMPOSE_ENV_FILE". Runnern ser inte /config/.env, sa utan den
+# flaggan blir ${TZ} m.fl. tomma nar compose laser filen.
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Build and Push Docker Image"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: deploy-tillyse
+  group: deploy-fiskeapp-tillyse
   cancel-in-progress: false
 
-env:
-  IMAGE: ghcr.io/htilly/fiskeapp
-  COMPOSE: docker compose -p config -f /config/docker-compose.yml
-
 jobs:
-  deploy:
-    name: Pull and restart fiskeapp
-    runs-on: [self-hosted, tillyse-deploy]
-    timeout-minutes: 30
+  # ---------------------------------------------------------------------------
+  # Grind. Kors pa GitHubs egen runner, alltsa INNAN nagonting alls far hamnas
+  # pa tillyse. Slapper den inte igenom startar den self-hosted runnern aldrig.
+  gate:
+    name: Check who triggered this
+    runs-on: ubuntu-latest
+
+    # Bara ett lyckat bygge, av en push (inte PR), till main, i detta repo
+    # (inte en fork).
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+
+    env:
+      # =====================================================================
+      # VILKA KONTON FAR DEPLOYA TILL TILLYSE
+      # Mellanslagsseparerade GitHub-anvandarnamn. Lagg till fler har.
+      # Tom lista = ingen deploy sker over huvud taget.
+      ALLOWED_ACTORS: "htilly"
+      # =====================================================================
+
+      # actor = den som startade bygget. triggering_actor = den som startade
+      # just det korningsforsoket, vilket skiljer sig vid en re-run. Bada maste
+      # finnas i listan, annars kan nagon annan re-runna ditt bygge och deploya.
+      RUN_ACTOR: ${{ github.event.workflow_run.actor.login }}
+      RERUN_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
+
     steps:
-      - name: Wait for the image built from the release commit
-        env:
-          SHA: ${{ github.sha }}
+      - name: Match actor against the allowlist
+        id: check
         run: |
-          TAG="main-${SHA::7}"
-          for i in $(seq 1 60); do
-            if docker manifest inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
-              echo "Found ${IMAGE}:${TAG}"
-              exit 0
+          set -euo pipefail
+
+          allowed=true
+          for who in "$RUN_ACTOR" "$RERUN_ACTOR"; do
+            if [ -z "$who" ]; then
+              echo "::warning::tomt anvandarnamn - ingen deploy"
+              allowed=false
+              continue
             fi
-            echo "Waiting for ${IMAGE}:${TAG} (${i}/60)..."
-            sleep 20
+            case " $ALLOWED_ACTORS " in
+              *" $who "*) echo "ok: $who star i ALLOWED_ACTORS" ;;
+              *) echo "::warning::$who star INTE i ALLOWED_ACTORS - ingen deploy"; allowed=false ;;
+            esac
           done
-          echo "Image ${IMAGE}:${TAG} never appeared" >&2
-          exit 1
 
-      - name: Pull and restart
-        run: |
-          ${COMPOSE} pull fiskeapp
-          ${COMPOSE} up -d --no-deps fiskeapp
+          echo "allowed=$allowed" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Grind"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| startade bygget | \`$RUN_ACTOR\` |"
+            echo "| startade korningen | \`$RERUN_ACTOR\` |"
+            echo "| tillatna konton | \`$ALLOWED_ACTORS\` |"
+            echo "| deploy | \`$allowed\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Wait for healthy container
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy fiskeapp to tillyse
+    needs: gate
+    if: >-
+      needs.gate.outputs.allowed == 'true' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: [self-hosted, fiskeapp]
+
+    # Andra grinden, pa GitHubs sida och oberoende av YAML-uttrycken ovan:
+    # miljon tillyse slapper bara igenom korningar fran main.
+    environment: tillyse
+
+    env:
+      IMAGE: ghcr.io/htilly/fiskeapp
+      SERVICE: fiskeapp
+      CONTAINER: fiskeapp
+      COMPOSE_PROJECT: config
+      COMPOSE_DIR: /config
+      # Runnern delar config_default med appen och nar den pa containerporten
+      # (80), inte vardens 127.0.0.1:8891.
+      APP_URL: http://fiskeapp:80
+      # DOCKER_HOST, NTFY_URL, NTFY_TOKEN, COMPOSE_FILE_PATH och COMPOSE_ENV_FILE
+      # kommer fran runnerns container-miljo (se /config/docker-compose.yml och
+      # /config/secrets/fiskeapp-runner.env pa tillyse).
+
+    steps:
+      # -----------------------------------------------------------------------
+      - name: Preflight
+        id: pre
         run: |
-          # Healthchecken har intervall 3m, så första "healthy" kan dröja.
-          for i in $(seq 1 60); do
-            STATUS="$(docker inspect -f '{{.State.Health.Status}}' fiskeapp 2>/dev/null || echo missing)"
-            echo "fiskeapp health: ${STATUS}"
-            [ "${STATUS}" = "healthy" ] && exit 0
+          set -euo pipefail
+
+          fail=0
+          for v in DOCKER_HOST NTFY_URL NTFY_TOKEN COMPOSE_FILE_PATH COMPOSE_ENV_FILE; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::$v ar inte satt i runnerns miljo"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+          test -r "$COMPOSE_FILE_PATH" || { echo "::error::kan inte lasa $COMPOSE_FILE_PATH"; exit 1; }
+          docker version --format '{{.Server.Version}}' > /dev/null \
+            || { echo "::error::nar inte socket-proxyn pa $DOCKER_HOST"; exit 1; }
+
+          # Compose-filen maste faktiskt peka tjansten pa taggen vi deployar.
+          if ! grep -qE "^\s+image:\s+${IMAGE}:main\s*$" "$COMPOSE_FILE_PATH"; then
+            echo "::error::$COMPOSE_FILE_PATH pekar inte $SERVICE pa ${IMAGE}:main"
+            exit 1
+          fi
+
+          FULL_SHA="${{ github.event.workflow_run.head_sha }}"
+          SHORT_SHA="${FULL_SHA:0:7}"
+          STAMP="$(date +%Y%m%d-%H%M%S)"
+
+          echo "full_sha=$FULL_SHA"           >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA"         >> "$GITHUB_OUTPUT"
+          echo "rollback_tag=rollback-$STAMP" >> "$GITHUB_OUTPUT"
+          echo "started_epoch=$(date +%s)"    >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Deploy fiskeapp till tillyse"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`$FULL_SHA\` |"
+            echo "| image | \`${IMAGE}:main-$SHORT_SHA\` |"
+            echo "| rollback-tagg | \`rollback-$STAMP\` |"
+            echo "| bygge | [#${{ github.event.workflow_run.run_number }}](${{ github.event.workflow_run.html_url }}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      - name: Capture current state for rollback
+        id: rollback_tag
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.pre.outputs.rollback_tag }}"
+
+          if docker image inspect "$IMAGE:main" > /dev/null 2>&1; then
+            docker tag "$IMAGE:main" "$IMAGE:$TAG"
+            echo "taggade $IMAGE:main -> $IMAGE:$TAG"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::$IMAGE:main finns inte lokalt, inget att rulla tillbaka till"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Hamta exakt den sha-pinnade taggen bygget pushade och flytta :main dit.
+      # Det ar det som gor deployen bevisbart lika med commiten som triggade.
+      - name: Pull the image built from this commit
+        id: pull
+        run: |
+          set -euo pipefail
+          SHORT="${{ steps.pre.outputs.short_sha }}"
+
+          echo "::group::pull $IMAGE:main-$SHORT"
+          docker pull "$IMAGE:main-$SHORT"
+          docker tag  "$IMAGE:main-$SHORT" "$IMAGE:main"
+          TARGET=$(docker image inspect -f '{{.Id}}' "$IMAGE:main")
+          echo "target image id: $TARGET"
+          echo "target_id=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: Recreate fiskeapp
+        run: |
+          set -euo pipefail
+          # --no-deps plus att tjansten namnges explicit haller compose borta
+          # fran de ovriga containrarna pa maskinen.
+          docker compose \
+            -p "$COMPOSE_PROJECT" \
+            --project-directory "$COMPOSE_DIR" \
+            --env-file "$COMPOSE_ENV_FILE" \
+            -f "$COMPOSE_FILE_PATH" \
+            up -d --no-deps --force-recreate \
+            "$SERVICE"
+
+      # -----------------------------------------------------------------------
+      - name: Wait for fiskeapp to become healthy
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 300 ))
+
+          echo "::group::$CONTAINER"
+          while :; do
+            STATE=$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo missing)
+            HEALTH=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER" 2>/dev/null || echo none)
+            echo "$CONTAINER: state=$STATE health=$HEALTH"
+
+            if [ "$STATE" = "running" ] && { [ "$HEALTH" = "healthy" ] || [ "$HEALTH" = "none" ]; }; then
+              break
+            fi
+            if [ "$STATE" = "exited" ] || [ "$STATE" = "dead" ] || [ "$HEALTH" = "unhealthy" ]; then
+              echo "::error::$CONTAINER ar $STATE/$HEALTH"
+              docker logs --tail 80 "$CONTAINER" || true
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::tidsgransen gick ut i vantan pa $CONTAINER (state=$STATE health=$HEALTH)"
+              docker logs --tail 80 "$CONTAINER" || true
+              exit 1
+            fi
             sleep 5
           done
-          docker logs --tail 50 fiskeapp >&2
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      - name: Verify the running container is the image built from this commit
+        run: |
+          set -euo pipefail
+          EXPECTED="${{ steps.pull.outputs.target_id }}"
+          RUNNING=$(docker inspect -f '{{.Image}}' "$CONTAINER")
+          echo "forvantad image id: $EXPECTED"
+          echo "korande image id:  $RUNNING"
+          if [ "$RUNNING" != "$EXPECTED" ]; then
+            echo "::error::$CONTAINER kor $RUNNING, inte imagen byggd fran ${{ steps.pre.outputs.full_sha }}"
+            exit 1
+          fi
+          echo "containern ar bevisbart bygget fran ${{ steps.pre.outputs.short_sha }}"
+
+      # -----------------------------------------------------------------------
+      - name: Verify the API answers
+        run: |
+          set -euo pipefail
+          OUT=""
+          for attempt in $(seq 1 24); do
+            if OUT=$(curl -fsS --max-time 10 "$APP_URL/api/health"); then
+              break
+            fi
+            echo "forsok $attempt: /api/health svarar inte an"
+            OUT=""
+            sleep 5
+          done
+          [ -n "$OUT" ] || { echo "::error::/api/health svarade aldrig"; exit 1; }
+          echo "health: $OUT"
+          case "$OUT" in
+            *'"ok":true'*) echo "health OK" ;;
+            *) echo "::error::ovantat svar fran /api/health: $OUT"; exit 1 ;;
+          esac
+
+      # -----------------------------------------------------------------------
+      - name: Verify the page is served
+        run: |
+          set -euo pipefail
+          CODE=$(curl -o /dev/null -sS -w '%{http_code}' --max-time 10 "$APP_URL/")
+          echo "index http=$CODE"
+          [ "$CODE" = "200" ] || { echo "::error::index gav inte 200 (fick $CODE)"; exit 1; }
+
+          SW=$(curl -o /dev/null -sS -w '%{http_code}' --max-time 10 "$APP_URL/sw.js")
+          echo "sw.js http=$SW"
+          [ "$SW" = "200" ] || { echo "::error::sw.js gav inte 200 (fick $SW)"; exit 1; }
+
+      # -----------------------------------------------------------------------
+      # Appen ligger pa en publik URL och all fangstdata ar privat. Skulle en
+      # regression gora /api/me oppen vore det ett lackage, sa det far falla
+      # deployen.
+      - name: Verify the API still requires login
+        run: |
+          set -euo pipefail
+          CODE=$(curl -o /dev/null -sS -w '%{http_code}' --max-time 10 "$APP_URL/api/me")
+          echo "/api/me (utan cookie) http=$CODE"
+          [ "$CODE" = "401" ] || { echo "::error::/api/me gav $CODE utan inloggning, forvantade 401"; exit 1; }
+
+      # -----------------------------------------------------------------------
+      - name: Roll back on failure
+        if: failure() && steps.rollback_tag.outputs.available == 'true'
+        run: |
+          set -uo pipefail
+          TAG="${{ steps.pre.outputs.rollback_tag }}"
+          echo "::warning::rullar $IMAGE:main tillbaka till $IMAGE:$TAG"
+
+          docker tag "$IMAGE:$TAG" "$IMAGE:main" || { echo "::error::retag misslyckades"; exit 1; }
+          docker compose \
+            -p "$COMPOSE_PROJECT" \
+            --project-directory "$COMPOSE_DIR" \
+            --env-file "$COMPOSE_ENV_FILE" \
+            -f "$COMPOSE_FILE_PATH" \
+            up -d --no-deps --force-recreate \
+            "$SERVICE" || { echo "::error::rollback-recreate misslyckades - fiskeapp kan vara nere"; exit 1; }
+
+          for attempt in $(seq 1 24); do
+            if OUT=$(curl -fsS --max-time 10 "$APP_URL/api/health"); then
+              echo "rullade tillbaka, svarar nu: $OUT"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::rullade tillbaka men fiskeapp svarar inte pa /api/health"
           exit 1
+
+      # -----------------------------------------------------------------------
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo ""
+            echo "Deployen lyckades. Alla kontroller gick igenom."
+            echo ""
+            echo "Rulla tillbaka manuellt, pa tillyse:"
+            echo '```bash'
+            echo "docker tag $IMAGE:${{ steps.pre.outputs.rollback_tag }} $IMAGE:main"
+            echo "cd /config && docker compose -p config --env-file /config/fiskeapp-runner/compose.env \\"
+            echo "  -f /config/docker-compose.yml up -d --no-deps --force-recreate fiskeapp"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      - name: Notify ntfy on success
+        if: success()
+        env:
+          # Commit-meddelandet ar text nagon annan kan styra. Det gar via miljon
+          # och refereras bara som "$COMMIT_MESSAGE", sa det kan inte
+          # interpoleras in i skriptet och koras.
+          COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
+        run: |
+          set -uo pipefail
+
+          SHORT="${{ steps.pre.outputs.short_sha }}"
+          STARTED="${{ steps.pre.outputs.started_epoch }}"
+
+          SUBJECT=$(printf '%s' "$COMMIT_MESSAGE" | head -n 1 | cut -c1-120)
+          [ -n "$SUBJECT" ] || SUBJECT="(inget commit-meddelande)"
+
+          if [ -n "$STARTED" ]; then
+            D=$(( $(date +%s) - STARTED ))
+            if [ "$D" -ge 60 ]; then DUR="$(( D / 60 ))m $(( D % 60 ))s"; else DUR="${D}s"; fi
+          else
+            DUR="okant"
+          fi
+
+          BODY=$(printf '%s\n' \
+            "$SUBJECT" \
+            "Omstartade: fiskeapp" \
+            "Tid: $DUR")
+
+          if [ -z "${NTFY_TOKEN:-}" ]; then
+            echo "::error::NTFY_TOKEN saknas - kunde inte skicka notisen"
+            exit 1
+          fi
+
+          curl -s -H "Authorization: Bearer $NTFY_TOKEN" \
+               -H "Title: fiskeapp deployad: $SHORT" \
+               -H "Priority: default" \
+               -H "Tags: white_check_mark" \
+               -d "$BODY" \
+               "$NTFY_URL" > /dev/null \
+            && echo "ntfy-notis skickad" \
+            || echo "::warning::ntfy-notisen kunde inte skickas"
+
+      # -----------------------------------------------------------------------
+      - name: Notify ntfy on failure
+        if: failure()
+        run: |
+          set -uo pipefail
+          TAG="${{ steps.pre.outputs.rollback_tag }}"
+          SHORT="${{ steps.pre.outputs.short_sha }}"
+          ROLLED="${{ steps.rollback_tag.outputs.available == 'true' && 'ja (automatisk)' || 'nej - ingen rollback-image fanns' }}"
+
+          BODY=$(printf '%s\n' \
+            "Deployen av fiskeapp misslyckades pa tillyse ($(date '+%Y-%m-%d %H:%M'))." \
+            "Commit: ${SHORT:-okant}" \
+            "Rollback-tagg: ${TAG:-ingen skapad}" \
+            "Aterstalld: $ROLLED" \
+            "Logg: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+
+          [ -n "${NTFY_TOKEN:-}" ] || { echo "::error::NTFY_TOKEN saknas"; exit 0; }
+
+          curl -s -H "Authorization: Bearer $NTFY_TOKEN" \
+               -H "Title: fiskeapp-deploy MISSLYCKADES" \
+               -H "Priority: high" \
+               -H "Tags: warning" \
+               -d "$BODY" \
+               "$NTFY_URL" > /dev/null \
+            && echo "ntfy-felnotis skickad" \
+            || echo "::warning::ntfy-felnotisen kunde inte skickas"
