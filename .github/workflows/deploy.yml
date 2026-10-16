@@ -122,6 +122,10 @@ jobs:
       # Runnern delar config_default med appen och nar den pa containerporten
       # (80), inte vardens 127.0.0.1:8891.
       APP_URL: http://fiskeapp:80
+      # Startmarkoren appen skriver nar den faktiskt kommit upp
+      # (api/src/server.js). Andras den pa ena stallet maste den andras pa bada.
+      READY_MARKER: FISKEAPP_READY
+      READY_TIMEOUT_SECONDS: "120"
       # DOCKER_HOST, NTFY_URL, NTFY_TOKEN, COMPOSE_FILE_PATH och COMPOSE_ENV_FILE
       # kommer fran runnerns container-miljo (se /config/docker-compose.yml och
       # /config/secrets/fiskeapp-runner.env pa tillyse).
@@ -207,8 +211,14 @@ jobs:
 
       # -----------------------------------------------------------------------
       - name: Recreate fiskeapp
+        id: recreate
         run: |
           set -euo pipefail
+          # Fonstret som loggkontrollerna nedan laser. Nagra sekunder bakat sa
+          # att ingenting missas mellan tidsstampel och start.
+          SINCE=$(date -u --date='-5 seconds' +%Y-%m-%dT%H:%M:%SZ)
+          echo "since=$SINCE" >> "$GITHUB_OUTPUT"
+
           # --no-deps plus att tjansten namnges explicit haller compose borta
           # fran de ovriga containrarna pa maskinen.
           docker compose \
@@ -218,6 +228,64 @@ jobs:
             -f "$COMPOSE_FILE_PATH" \
             up -d --no-deps --force-recreate \
             "$SERVICE"
+
+      # -----------------------------------------------------------------------
+      # GRIND: appen maste sjalv saga att den kom upp. Markoren skrivs av
+      # api/src/server.js efter en lyckad listen(). Utan den faller deployen -
+      # det ar skillnaden mot att bara titta pa containerns state.
+      #
+      # REDAKTION: Actions-loggen for det har repot ar PUBLIK. Appens logg
+      # innehaller klient-IP:n och URL:er och kan innehalla anvandardata, sa
+      # ingen loggrad skrivs ut harunder. Bara traff/ingen traff och sekunder.
+      - name: Startup log gate
+        id: ready
+        run: |
+          set -uo pipefail
+          SINCE="${{ steps.recreate.outputs.since }}"
+          FULL_SHA="${{ steps.pre.outputs.full_sha }}"
+
+          LOG=$(mktemp)
+          trap 'rm -f "$LOG"' EXIT
+
+          start=$(date +%s)
+          deadline=$(( start + READY_TIMEOUT_SECONDS ))
+          found=0
+          sha_ok=0
+
+          while :; do
+            # Till fil, inte genom en pipe: `grep -q` stanger pipen tidigt och
+            # da skulle `docker logs` do av SIGPIPE och sla ut pipefail.
+            docker logs --since "$SINCE" "$CONTAINER" > "$LOG" 2>&1 || true
+
+            if grep -qF "$READY_MARKER" "$LOG"; then
+              found=1
+              grep -qF "$READY_MARKER sha=$FULL_SHA" "$LOG" && sha_ok=1
+              break
+            fi
+            [ "$(date +%s)" -lt "$deadline" ] || break
+            sleep 2
+          done
+
+          waited=$(( $(date +%s) - start ))
+          echo "waited=$waited" >> "$GITHUB_OUTPUT"
+
+          if [ "$found" -ne 1 ]; then
+            echo "::error::startmarkoren dok inte upp i $CONTAINER inom ${READY_TIMEOUT_SECONDS}s - appen kom inte upp"
+            echo "marker=missing" >> "$GITHUB_OUTPUT"
+            echo "| startmarkor | **saknas efter ${waited}s** |" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "$sha_ok" -ne 1 ]; then
+            echo "::error::startmarkoren hittades, men inte for commit $FULL_SHA - containern kor nagot annat"
+            echo "marker=wrong-sha" >> "$GITHUB_OUTPUT"
+            echo "| startmarkor | **hittad, men fran en annan commit** |" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "startmarkoren hittades efter ${waited}s, for commit $FULL_SHA"
+          echo "marker=ok" >> "$GITHUB_OUTPUT"
+          echo "| startmarkor | hittad efter ${waited}s |" >> "$GITHUB_STEP_SUMMARY"
 
       # -----------------------------------------------------------------------
       - name: Wait for fiskeapp to become healthy
@@ -236,12 +304,14 @@ jobs:
             fi
             if [ "$STATE" = "exited" ] || [ "$STATE" = "dead" ] || [ "$HEALTH" = "unhealthy" ]; then
               echo "::error::$CONTAINER ar $STATE/$HEALTH"
-              docker logs --tail 80 "$CONTAINER" || true
+              # Medvetet INGEN `docker logs` har: loggen for det har repot ar
+              # publik. Felsammanfattningen langre ner ar redigerad i stallet.
               exit 1
             fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
               echo "::error::tidsgransen gick ut i vantan pa $CONTAINER (state=$STATE health=$HEALTH)"
-              docker logs --tail 80 "$CONTAINER" || true
+              # Medvetet INGEN `docker logs` har: loggen for det har repot ar
+              # publik. Felsammanfattningen langre ner ar redigerad i stallet.
               exit 1
             fi
             sleep 5
@@ -306,6 +376,95 @@ jobs:
           [ "$CODE" = "401" ] || { echo "::error::/api/me gav $CODE utan inloggning, forvantade 401"; exit 1; }
 
       # -----------------------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # Felsammanfattning - REDIGERAD. Kors alltid, aven nar grinden ovan foll,
+      # sa att en misslyckad deploy sager nagot om varfor.
+      #
+      # Ingen loggrad lamnar maskinen. Det enda som skrivs ar: antal rader i
+      # fonstret, antal felrader, fasta texter for monster vi kanner igen, och
+      # antalet felrader vi INTE kunde klassificera (utan deras innehall).
+      - name: Summarise startup errors (redacted)
+        if: always()
+        run: |
+          set -uo pipefail
+          SINCE="${{ steps.recreate.outputs.since }}"
+          [ -n "$SINCE" ] || SINCE="15m"
+
+          LOG=$(mktemp)
+          HITS=$(mktemp)
+          trap 'rm -f "$LOG" "$HITS"' EXIT
+          docker logs --since "$SINCE" "$CONTAINER" > "$LOG" 2>&1 || true
+
+          TOTAL=$(wc -l < "$LOG" | tr -d ' ')
+          # pino: level 50 = error, 60 = fatal. nginx: [error]/[crit]/[alert]/[emerg].
+          ERRORS=$(grep -Ec '"level":(50|60)|\[(error|crit|alert|emerg)\]' "$LOG" || true)
+          ERRORS=${ERRORS:-0}
+
+          # Tillatlista: monster vi vagar beratta om, och den FASTA text som
+          # skrivs i stallet for sjalva raden. Lagg bara till monster vars text
+          # inte kan innehalla anvandardata, sokvagar eller adresser.
+          PATTERNS=(
+            'connect\(\) failed \(111: Connection refused\) while connecting to upstream'
+            'bind\(\) to [^ ]*:80 failed'
+            'EADDRINUSE'
+            'Cannot find module|MODULE_NOT_FOUND'
+            'SQLITE_CANTOPEN|unable to open database file'
+            'SQLITE_READONLY|attempt to write a readonly database'
+          )
+          LABELS=(
+            'nginx nadde inte API:t pa 127.0.0.1:3000 (upstream refused)'
+            'nginx kunde inte binda port 80'
+            'porten var redan upptagen (EADDRINUSE)'
+            'en node-modul saknas i imagen'
+            'kunde inte oppna SQLite-databasen under /data'
+            'databasen under /data ar skrivskyddad'
+          )
+
+          classified=0
+          i=0
+          while [ "$i" -lt "${#PATTERNS[@]}" ]; do
+            n=$(grep -Ec "${PATTERNS[$i]}" "$LOG" || true)
+            n=${n:-0}
+            if [ "$n" -gt 0 ]; then
+              classified=$(( classified + n ))
+              printf -- '- %s: %s\n' "${LABELS[$i]}" "$n" >> "$HITS"
+            fi
+            i=$(( i + 1 ))
+          done
+
+          unknown=$(( ERRORS - classified ))
+          [ "$unknown" -ge 0 ] || unknown=0
+
+          echo "loggrader i fonstret: $TOTAL"
+          echo "felrader: $ERRORS (klassificerade: $classified, oklassificerade: $unknown)"
+
+          {
+            echo ""
+            echo "#### Startlogg"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| loggrader i fonstret | $TOTAL |"
+            echo "| felrader | $ERRORS |"
+            echo ""
+            if [ -s "$HITS" ]; then
+              echo "Kanda fel:"
+              echo ""
+              cat "$HITS"
+              echo ""
+            fi
+            if [ "$unknown" -gt 0 ]; then
+              echo "$unknown felrad(er) matchade inget kant monster och visas INTE har - loggen for det har repot ar publik. Las dem pa tillyse med:"
+              echo ""
+              echo '```bash'
+              echo "docker logs --since $SINCE fiskeapp"
+              echo '```'
+            fi
+            if [ "$ERRORS" -eq 0 ]; then
+              echo "Inga felrader i startfonstret."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Roll back on failure
         if: failure() && steps.rollback_tag.outputs.available == 'true'
         run: |
