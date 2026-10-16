@@ -124,8 +124,8 @@ jobs:
       APP_URL: http://fiskeapp:80
       # Startmarkoren appen skriver nar den faktiskt kommit upp
       # (api/src/server.js). Andras den pa ena stallet maste den andras pa bada.
-      READY_MARKER: FISKEAPP_NEVER_LOGS_THIS
-      READY_TIMEOUT_SECONDS: "30"
+      READY_MARKER: FISKEAPP_READY
+      READY_TIMEOUT_SECONDS: "120"
       # DOCKER_HOST, NTFY_URL, NTFY_TOKEN, COMPOSE_FILE_PATH och COMPOSE_ENV_FILE
       # kommer fran runnerns container-miljo (se /config/docker-compose.yml och
       # /config/secrets/fiskeapp-runner.env pa tillyse).
