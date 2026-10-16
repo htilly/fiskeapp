@@ -1,8 +1,10 @@
 # fiskeapp
 
-En minimal Docker-container som skriver ut "Hello World" – startpunkt för en fiske-app.
+En minimal Docker-container som serverar en "Hello World"-sida över HTTP (nginx på port 80) – startpunkt för en fiske-app.
 
 ```sh
 docker build -t fiskeapp .
-docker run --rm fiskeapp
+docker run --rm -p 8080:80 fiskeapp
 ```
+
+Öppna sedan http://localhost:8080.
