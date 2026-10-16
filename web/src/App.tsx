@@ -6,6 +6,7 @@ import { Home } from './components/Home';
 import { MapView } from './components/MapView';
 import { Log } from './components/Log';
 import { CatchSheet } from './components/CatchSheet';
+import { Settings } from './components/Settings';
 
 type Tab = 'home' | 'map' | 'log';
 export type Spot = { lat: number; lng: number };
@@ -15,7 +16,7 @@ export function App() {
   useEffect(() => { api.me().then(setUser).catch(() => setUser(null)); }, []);
 
   if (user === undefined) return <div className="splash">🐟</div>;
-  if (!user) return <Login onLogin={setUser} />;
+  if (!user) return <Login onLogin={setUser} inviteToken={new URLSearchParams(location.search).get('add')} />;
   return <Main user={user} onLogout={async () => { await api.logout(); setUser(null); }} />;
 }
 
@@ -24,6 +25,7 @@ function Main({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [catches, setCatches] = useState<Catch[]>([]);
   const [sheetSpot, setSheetSpot] = useState<Spot | null>(null);
   const { pos, error } = useLocation();
+  const [settings, setSettings] = useState(false);
   const [lake, setLake] = useState<string | null>(null);
   const [weather, setWeather] = useState<Weather | null>(null);
 
@@ -42,7 +44,7 @@ function Main({ user, onLogout }: { user: User; onLogout: () => void }) {
       <main className="screen">
         {tab === 'home' && (
           <Home user={user} pos={pos} geoError={error} lake={lake} weather={weather} catches={catches}
-            onCatch={() => pos && setSheetSpot({ lat: pos.lat, lng: pos.lng })} onLogout={onLogout} />
+            onCatch={() => pos && setSheetSpot({ lat: pos.lat, lng: pos.lng })} onLogout={onLogout} onSettings={() => setSettings(true)} />
         )}
         {tab === 'map' && <MapView pos={pos} catches={catches} onPick={setSheetSpot} />}
         {tab === 'log' && <Log catches={catches} onChange={reload} />}
@@ -54,6 +56,7 @@ function Main({ user, onLogout }: { user: User; onLogout: () => void }) {
           </button>
         ))}
       </nav>
+      {settings && <Settings onClose={() => setSettings(false)} />}
       {sheetSpot && (
         <CatchSheet spot={sheetSpot} lake={lake} weather={weather} onClose={() => setSheetSpot(null)}
           onSaved={() => { setSheetSpot(null); reload(); setTab('log'); }} />

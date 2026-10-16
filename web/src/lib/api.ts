@@ -24,6 +24,9 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
 export const api = {
   me: () => req<User>('GET', '/api/me'),
   post: <T>(url: string, body?: unknown) => req<T>('POST', url, body ?? {}),
+  patch: <T>(url: string, body: unknown) => req<T>('PATCH', url, body),
+  del: <T>(url: string) => req<T>('DELETE', url),
+  get: <T>(url: string) => req<T>('GET', url),
   logout: () => req<void>('POST', '/api/auth/logout', {}),
   catches: () => req<Catch[]>('GET', '/api/catches'),
   addCatch: (c: Partial<Catch>) => req<Catch>('POST', '/api/catches', c),

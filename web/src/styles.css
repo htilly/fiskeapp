@@ -75,3 +75,7 @@ input:focus { border-color: var(--cyan); } input::placeholder { color: #6a7a98; 
 .catch-body { padding: 14px 16px 16px; } .catch-head { display: flex; justify-content: space-between; align-items: center; }
 .badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; } .badges span { background: var(--card2); border-radius: 99px; padding: 5px 11px; font-size: .82rem; }
 .note { margin-top: 10px; color: #c8d4ee; font-size: .92rem; }
+
+.device { display: flex; align-items: center; gap: 8px; } .device > div { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.invite { display: flex; flex-direction: column; align-items: center; gap: 8px; } .invite img { background: #fff; border-radius: 12px; padding: 6px; }
+.recovery { font-family: ui-monospace, monospace; font-size: 1.25rem; letter-spacing: .06em; text-align: center; user-select: all; }
