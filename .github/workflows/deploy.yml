@@ -1,0 +1,69 @@
+name: Deploy to tillyse
+
+# Deployar på tillyse via en self-hosted runner när en release publiceras.
+#
+# SÄKERHET: repot är publikt och runnern kör som en användare i docker-gruppen
+# (= root-ekvivalent). Därför:
+#   - jobbet triggas ENBART av `release: published` (kräver write-access till
+#     repot) - aldrig av pull_request, push eller fork-händelser.
+#   - repots inställning "Fork pull request workflows" ska vara "Require approval
+#     for all outside collaborators", annars kan en fork-PR som ändrar den här
+#     filen köra kod på servern.
+#   - runnern har ett eget label (tillyse-deploy) och används av inget annat.
+#
+# Imagen byggs av docker-image.yml vid push till main. Den här workflowen väntar
+# på att imagen för releasens commit finns, drar :main och startar om fiskeapp.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-tillyse
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/htilly/fiskeapp
+  COMPOSE: docker compose -p config -f /config/docker-compose.yml
+
+jobs:
+  deploy:
+    name: Pull and restart fiskeapp
+    runs-on: [self-hosted, tillyse-deploy]
+    timeout-minutes: 30
+    steps:
+      - name: Wait for the image built from the release commit
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          TAG="main-${SHA::7}"
+          for i in $(seq 1 60); do
+            if docker manifest inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+              echo "Found ${IMAGE}:${TAG}"
+              exit 0
+            fi
+            echo "Waiting for ${IMAGE}:${TAG} (${i}/60)..."
+            sleep 20
+          done
+          echo "Image ${IMAGE}:${TAG} never appeared" >&2
+          exit 1
+
+      - name: Pull and restart
+        run: |
+          ${COMPOSE} pull fiskeapp
+          ${COMPOSE} up -d --no-deps fiskeapp
+
+      - name: Wait for healthy container
+        run: |
+          # Healthchecken har intervall 3m, så första "healthy" kan dröja.
+          for i in $(seq 1 60); do
+            STATUS="$(docker inspect -f '{{.State.Health.Status}}' fiskeapp 2>/dev/null || echo missing)"
+            echo "fiskeapp health: ${STATUS}"
+            [ "${STATUS}" = "healthy" ] && exit 0
+            sleep 5
+          done
+          docker logs --tail 50 fiskeapp >&2
+          exit 1
