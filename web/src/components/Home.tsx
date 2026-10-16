@@ -3,10 +3,10 @@ import { describeWeather, fishingTip, windDirName, type Pos } from '../lib/geo';
 
 type Props = {
   user: User; pos: Pos | null; geoError: string | null; lake: string | null;
-  weather: Weather | null; catches: Catch[]; onCatch: () => void; onLogout: () => void;
+  weather: Weather | null; catches: Catch[]; onCatch: () => void; onLogout: () => void; onSettings: () => void;
 };
 
-export function Home({ user, pos, geoError, lake, weather, catches, onCatch, onLogout }: Props) {
+export function Home({ user, pos, geoError, lake, weather, catches, onCatch, onLogout, onSettings }: Props) {
   const w = weather && describeWeather(weather.code);
   const biggest = catches.reduce((m, c) => Math.max(m, c.length_cm ?? 0), 0);
   const species = new Set(catches.map((c) => c.species)).size;
@@ -18,7 +18,10 @@ export function Home({ user, pos, geoError, lake, weather, catches, onCatch, onL
           <p className="muted small">Tjena {user.name} 👋</p>
           <h2>{pos ? (lake ?? 'Letar efter vatten…') : 'Var är du?'}</h2>
         </div>
-        <button className="ghost" onClick={onLogout} aria-label="Logga ut">🚪</button>
+        <div className="chips">
+          <button className="ghost" onClick={onSettings} aria-label="Enheter">⚙️</button>
+          <button className="ghost" onClick={onLogout} aria-label="Logga ut">🚪</button>
+        </div>
       </header>
 
       {geoError && !pos && <div className="card warn">{geoError}</div>}
