@@ -24,6 +24,9 @@ RUN npm ci --omit=dev
 
 # --- 3. runtime: nginx + node i samma container ------------------------------
 FROM node:24-alpine
+# nginx kommer från Alpines paketrepo i basimagen, inte från en nginx-image.
+# Bygg om för att plocka upp säkerhetsfixar därifrån: 2026-11-21 gav det
+# nginx 1.30.7 (nginx2root, CVE-2026-123007 m.fl.) i stället för 1.30.4.
 RUN apk add --no-cache nginx && mkdir -p /run/nginx
 
 WORKDIR /app
